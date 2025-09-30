@@ -1,0 +1,171 @@
+name: 'Go Release Action'
+description: 'A comprehensive GitHub action for Go projects with lint, build, test, versioning, and release capabilities'
+author: 'Flanksource'
+
+inputs:
+  go-version:
+    description: 'Go version to use'
+    required: false
+    default: '1.21'
+  enable-lint:
+    description: 'Enable linting with golangci-lint'
+    required: false
+    default: 'true'
+  enable-test:
+    description: 'Enable testing'
+    required: false
+    default: 'true'
+  enable-build:
+    description: 'Enable building binaries'
+    required: false
+    default: 'true'
+  enable-docker:
+    description: 'Enable Docker image building'
+    required: false
+    default: 'true'
+  enable-release:
+    description: 'Enable automatic releases'
+    required: false
+    default: 'true'
+  docker-platforms:
+    description: 'Docker platforms to build for'
+    required: false
+    default: 'linux/amd64,linux/arm64'
+  build-platforms:
+    description: 'Platforms to build binaries for'
+    required: false
+    default: 'linux/amd64,linux/arm64,darwin/amd64,darwin/arm64,windows/amd64'
+  binary-name:
+    description: 'Name of the binary to build'
+    required: false
+    default: 'app'
+  github-token:
+    description: 'GitHub token for releases'
+    required: true
+
+outputs:
+  version:
+    description: 'The version that was released'
+    value: ${{ steps.version.outputs.version }}
+  release-url:
+    description: 'URL of the created release'
+    value: ${{ steps.release.outputs.html_url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        if [ -f go.mod ]; then
+          go mod download
+        fi
+
+    - name: Lint
+      if: inputs.enable-lint == 'true'
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+
+    - name: Test
+      if: inputs.enable-test == 'true'
+      shell: bash
+      run: |
+        if [ -f Makefile ] && grep -q "^test:" Makefile; then
+          make test
+        else
+          go test -v ./...
+        fi
+
+    - name: Get version
+      id: version
+      shell: bash
+      run: |
+        if command -v svu &> /dev/null; then
+          VERSION=$(svu patch)
+        else
+          # Install svu if not available
+          go install github.com/caarlos0/svu@latest
+          VERSION=$(svu patch)
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Build binaries
+      if: inputs.enable-build == 'true'
+      shell: bash
+      run: |
+        if [ -f Makefile ] && grep -q "^build:" Makefile; then
+          make build
+        else
+          # Default cross-platform build
+          IFS=',' read -ra PLATFORMS <<< "${{ inputs.build-platforms }}"
+          for platform in "${PLATFORMS[@]}"; do
+            IFS='/' read -ra PARTS <<< "$platform"
+            GOOS="${PARTS[0]}"
+            GOARCH="${PARTS[1]}"
+            output="${{ inputs.binary-name }}-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              output="${output}.exe"
+            fi
+            echo "Building for $GOOS/$GOARCH..."
+            GOOS=$GOOS GOARCH=$GOARCH go build -o "dist/$output" .
+          done
+        fi
+
+    - name: Set up Docker Buildx
+      if: inputs.enable-docker == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Hub
+      if: inputs.enable-docker == 'true' && github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ github.repository_owner }}
+        password: ${{ inputs.github-token }}
+
+    - name: Build and push Docker image
+      if: inputs.enable-docker == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: ${{ inputs.docker-platforms }}
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: |
+          ${{ github.repository }}:latest
+          ${{ github.repository }}:${{ steps.version.outputs.version }}
+
+    - name: Create Release
+      if: inputs.enable-release == 'true' && github.event_name != 'pull_request'
+      id: release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        name: Release ${{ steps.version.outputs.version }}
+        generate_release_notes: true
+        files: |
+          dist/*
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+
+branding:
+  icon: 'package'
+  color: 'blue'
